@@ -23,11 +23,12 @@ Examples:
 
 # Standard
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Generator, List, Optional
 import uuid
 
 # Third-Party
 import jsonschema
+from sqlalchemy.orm import Session
 from sqlalchemy import (
     Boolean,
     Column,
@@ -1277,7 +1278,7 @@ listen(Prompt, "before_insert", validate_prompt_schema)
 listen(Prompt, "before_update", validate_prompt_schema)
 
 
-def get_db():
+def get_db() -> Generator[Session, Any, None]:
     """
     Dependency to get database session.
 
