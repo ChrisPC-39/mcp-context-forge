@@ -38,7 +38,7 @@ import asyncio
 import logging
 import os
 import sys
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, Generic, List, Optional, TypeVar, Union
 from urllib.parse import urlparse
 
 # Third-Party
@@ -195,7 +195,7 @@ async def fetch_url(url: str) -> httpx.Response:
     headers = {"Authorization": f"Bearer {AUTH_TOKEN}"} if AUTH_TOKEN else {}
     async with ResilientHttpClient(client_args={"timeout": TOOL_CALL_TIMEOUT}) as client:
         try:
-            response = await client.get(url, headers=headers)
+            response: httpx.Response = await client.get(url, headers=headers)
             response.raise_for_status()
             return response
         except httpx.RequestError as err:
@@ -502,7 +502,7 @@ async def resources_metadata(resource_ids: List[str]) -> List[Dict[str, Any]]:
 # -----------------------------------------------------------------------------
 # Server Handlers
 # -----------------------------------------------------------------------------
-server: Server = Server("mcpgateway-wrapper")
+server: Server = Server(name="mcpgateway-wrapper")
 
 
 @server.list_tools()
