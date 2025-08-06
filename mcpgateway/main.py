@@ -30,7 +30,7 @@ import asyncio
 from contextlib import asynccontextmanager
 import json
 import logging
-from typing import Any, AsyncIterator, Dict, List, Optional, Union
+from typing import Any, AsyncGenerator, AsyncIterator, Dict, Generator, List, Optional, Union
 from urllib.parse import urlparse, urlunparse
 
 # Third-Party
@@ -41,6 +41,7 @@ from fastapi import (
     FastAPI,
     HTTPException,
     Request,
+    Response,
     status,
     WebSocket,
     WebSocketDisconnect,
@@ -54,6 +55,7 @@ from pydantic import ValidationError
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+from sse_starlette import EventSourceResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
@@ -70,8 +72,10 @@ from mcpgateway.models import (
     InitializeResult,
     ListResourceTemplatesResult,
     LogLevel,
+    PromptResult,
     ResourceContent,
     Root,
+    ToolResult,
 )
 from mcpgateway.schemas import (
     GatewayCreate,
@@ -138,7 +142,7 @@ from mcpgateway.validation.jsonrpc import (
 from mcpgateway.version import router as version_router
 
 # Initialize logging service first
-logging_service = LoggingService()
+logging_service: LoggingService = LoggingService()
 logger = logging_service.get_logger("mcpgateway")
 
 # Configure root logger level
@@ -160,21 +164,25 @@ else:
 
 
 # Initialize services
-tool_service = ToolService()
-resource_service = ResourceService()
-prompt_service = PromptService()
-gateway_service = GatewayService()
-root_service = RootService()
-completion_service = CompletionService()
-sampling_handler = SamplingHandler()
-server_service = ServerService()
+tool_service: ToolService = ToolService()
+resource_service: ResourceService = ResourceService()
+prompt_service: PromptService = PromptService()
+gateway_service: GatewayService = GatewayService()
+root_service: RootService = RootService()
+completion_service: CompletionService = CompletionService()
+sampling_handler: SamplingHandler = SamplingHandler()
+server_service: ServerService = ServerService()
 
 # Initialize session manager for Streamable HTTP transport
-streamable_http_session = SessionManagerWrapper()
+streamable_http_session: SessionManagerWrapper = SessionManagerWrapper()
 
 # Wait for redis to be ready
 if settings.cache_type == "redis":
-    wait_for_redis_ready(redis_url=settings.redis_url, max_retries=int(settings.redis_max_retries), retry_interval_ms=int(settings.redis_retry_interval_ms), sync=True)
+    if settings.redis_url is None:
+        redis_url: str = "redis://localhost:6379/0"
+    else:
+        redis_url: str = settings.redis_url
+    wait_for_redis_ready(redis_url=redis_url, max_retries=int(settings.redis_max_retries), retry_interval_ms=int(settings.redis_retry_interval_ms), sync=True)
 
 # Initialize session registry
 session_registry = SessionRegistry(
@@ -252,7 +260,7 @@ app = FastAPI(
 
 # Global exceptions handlers
 @app.exception_handler(ValidationError)
-async def validation_exception_handler(_request: Request, exc: ValidationError):
+async def validation_exception_handler(_request: Request, exc: ValidationError) -> JSONResponse:
     """Handle Pydantic validation errors globally.
 
     Intercepts ValidationError exceptions raised anywhere in the application
@@ -291,7 +299,7 @@ async def validation_exception_handler(_request: Request, exc: ValidationError):
 
 
 @app.exception_handler(IntegrityError)
-async def database_exception_handler(_request: Request, exc: IntegrityError):
+async def database_exception_handler(_request: Request, exc: IntegrityError) -> JSONResponse:
     """Handle SQLAlchemy database integrity constraint violations globally.
 
     Intercepts IntegrityError exceptions (e.g., unique constraint violations,
@@ -338,7 +346,7 @@ class DocsAuthMiddleware(BaseHTTPMiddleware):
         is also accepted using BASIC_AUTH_USER and BASIC_AUTH_PASSWORD credentials.
     """
 
-    async def dispatch(self, request: Request, call_next):
+    async def dispatch(self, request: Request, call_next) -> Union[JSONResponse, Response]:
         """
         Intercepts incoming requests to check if they are accessing protected documentation routes.
         If so, it requires a valid Bearer token; otherwise, it allows the request to proceed.
@@ -398,7 +406,7 @@ class MCPPathRewriteMiddleware:
     - All other requests are passed through without change.
     """
 
-    def __init__(self, application):
+    def __init__(self, application) -> None:
         """
         Initialize the middleware with the ASGI application.
 
@@ -407,7 +415,7 @@ class MCPPathRewriteMiddleware:
         """
         self.application = application
 
-    async def __call__(self, scope, receive, send):
+    async def __call__(self, scope, receive, send) -> None:
         """
         Intercept and potentially rewrite the incoming HTTP request path.
 
@@ -506,7 +514,7 @@ metrics_router = APIRouter(prefix="/metrics", tags=["Metrics"])
 
 
 # Database dependency
-def get_db():
+def get_db() -> Generator[Session, Any, None]:
     """
     Dependency function to provide a database session.
 
@@ -695,16 +703,16 @@ async def ping(request: Request, user: str = Depends(require_auth)) -> JSONRespo
         HTTPException: If the request method is not "ping".
     """
     try:
-        body: dict = await request.json()
+        body: dict[str, Any] = await request.json()
         if body.get("method") != "ping":
             raise HTTPException(status_code=400, detail="Invalid method")
-        req_id: str = body.get("id")
+        req_id: Union[Any, None] = body.get("id")
         logger.debug(f"Authenticated user {user} sent ping request.")
         # Return an empty result per the MCP ping specification.
-        response: dict = {"jsonrpc": "2.0", "id": req_id, "result": {}}
+        response: dict[str, Any] = {"jsonrpc": "2.0", "id": req_id, "result": {}}
         return JSONResponse(content=response)
     except Exception as e:
-        error_response: dict = {
+        error_response: dict[str, Any] = {
             "jsonrpc": "2.0",
             "id": body.get("id") if "body" in locals() else None,
             "error": {"code": -32603, "message": "Internal error", "data": str(e)},
@@ -948,7 +956,7 @@ async def delete_server(server_id: str, db: Session = Depends(get_db), user: str
 
 
 @server_router.get("/{server_id}/sse")
-async def sse_endpoint(request: Request, server_id: str, user: str = Depends(require_auth)):
+async def sse_endpoint(request: Request, server_id: str, user: str = Depends(require_auth)) -> EventSourceResponse:
     """
     Establishes a Server-Sent Events (SSE) connection for real-time updates about a server.
 
@@ -986,7 +994,7 @@ async def sse_endpoint(request: Request, server_id: str, user: str = Depends(req
 
 
 @server_router.post("/{server_id}/message")
-async def message_endpoint(request: Request, server_id: str, user: str = Depends(require_auth)):
+async def message_endpoint(request: Request, server_id: str, user: str = Depends(require_auth)) -> JSONResponse:
     """
     Handles incoming messages for a specific server.
 
@@ -1113,15 +1121,15 @@ async def server_get_prompts(
 #############
 # Tool APIs #
 #############
-@tool_router.get("", response_model=Union[List[ToolRead], List[Dict], Dict, List])
-@tool_router.get("/", response_model=Union[List[ToolRead], List[Dict], Dict, List])
+@tool_router.get("", response_model=Union[List[ToolRead], List[Dict[Any, Any]], Dict[Any, Any], List])
+@tool_router.get("/", response_model=Union[List[ToolRead], List[Dict[Any, Any]], Dict[Any, Any], List])
 async def list_tools(
     cursor: Optional[str] = None,
     include_inactive: bool = False,
     db: Session = Depends(get_db),
     apijsonpath: JsonPathModifier = Body(None),
     _: str = Depends(require_auth),
-) -> Union[List[ToolRead], List[Dict], Dict]:
+) -> Union[List[ToolRead], List[Dict[Any, Any]], Dict[Any, Any]]:
     """List all registered tools with pagination support.
 
     Args:
@@ -1183,7 +1191,7 @@ async def get_tool(
     db: Session = Depends(get_db),
     user: str = Depends(require_auth),
     apijsonpath: JsonPathModifier = Body(None),
-) -> Union[ToolRead, Dict]:
+) -> Union[ToolRead, Dict[Any, Any]]:
     """
     Retrieve a tool by ID, optionally applying a JSONPath post-filter.
 
@@ -1366,7 +1374,7 @@ async def list_resources(
     include_inactive: bool = False,
     db: Session = Depends(get_db),
     user: str = Depends(require_auth),
-) -> List[ResourceRead]:
+) -> Union[List[ResourceRead], Any]:
     """
     Retrieve a list of resources.
 
@@ -1394,7 +1402,7 @@ async def create_resource(
     resource: ResourceCreate,
     db: Session = Depends(get_db),
     user: str = Depends(require_auth),
-) -> ResourceRead:
+) -> Union[ResourceRead, JSONResponse]:
     """
     Create a new resource.
 
@@ -1423,7 +1431,7 @@ async def create_resource(
 
 
 @resource_router.get("/{uri:path}")
-async def read_resource(uri: str, db: Session = Depends(get_db), user: str = Depends(require_auth)) -> ResourceContent:
+async def read_resource(uri: str, db: Session = Depends(get_db), user: str = Depends(require_auth)) -> Union[ResourceContent, Any]:
     """
     Read a resource by its URI.
 
@@ -1508,6 +1516,38 @@ async def delete_resource(uri: str, db: Session = Depends(get_db), user: str = D
         raise HTTPException(status_code=400, detail=str(e))
 
 
+async def stream_subscribe_resources_events(uri: str) -> AsyncGenerator[str, None]:
+    """
+    Asynchronous generator that subscribes to server-sent events for a specific resource and yields them as JSON strings.
+
+    This function listens for events from the `resource_service.subscribe_events(uri)` method,
+    which is assumed to return a synchronous iterable. It converts the synchronous iterable 
+    into an asynchronous generator, serializes each event (a dictionary) to a JSON string, 
+    and yields the JSON strings. The yielded strings can be used in a Server-Sent Events (SSE) stream.
+
+    Args:
+        uri (str): URI of the resource to subscribe to.
+
+    Yields:
+        str: JSON-encoded string representing the event data.
+    """
+    async def async_generator_from_iterable(iterable: Any) -> AsyncGenerator[Any, None]:
+        """
+        Converts a synchronous iterable into an asynchronous generator.
+
+        Args:
+            iterable (Any): A synchronous iterable (e.g., list, set, or any iterable object).
+
+        Yields:
+            Any: Items from the synchronous iterable, yielded asynchronously.
+        """
+        for item in iterable:
+            yield item
+
+    async for event in async_generator_from_iterable(resource_service.subscribe_events(uri)):
+        yield json.dumps(event)
+
+
 @resource_router.post("/subscribe/{uri:path}")
 async def subscribe_resource(uri: str, user: str = Depends(require_auth)) -> StreamingResponse:
     """
@@ -1521,7 +1561,7 @@ async def subscribe_resource(uri: str, user: str = Depends(require_auth)) -> Str
         StreamingResponse: A streaming response with event updates.
     """
     logger.debug(f"User {user} is subscribing to resource with URI {uri}")
-    return StreamingResponse(resource_service.subscribe_events(uri), media_type="text/event-stream")
+    return StreamingResponse(stream_subscribe_resources_events(uri), media_type="text/event-stream")
 
 
 ###############
@@ -1795,7 +1835,7 @@ async def register_gateway(
     gateway: GatewayCreate,
     db: Session = Depends(get_db),
     user: str = Depends(require_auth),
-) -> GatewayRead:
+) -> (GatewayRead | JSONResponse):
     """
     Register a new gateway.
 
@@ -1945,6 +1985,35 @@ async def remove_root(
     return {"status": "success", "message": f"Root {uri} removed"}
 
 
+async def stream_subscribe_changes() -> AsyncGenerator[str, None]:
+    """
+    Asynchronous generator that subscribes to real-time changes and yields them as JSON strings.
+
+    This function listens for changes from the `root_service.subscribe_changes()` method,
+    which is assumed to return a synchronous iterable. It converts the synchronous iterable 
+    into an asynchronous generator, serializes each change (a dictionary) to a JSON string, 
+    and yields the JSON strings. The yielded strings can be used in a Server-Sent Events (SSE) stream.
+
+    Yields:
+        str: JSON-encoded string representing the change data.
+    """
+    async def async_generator_from_iterable(iterable: Any) -> AsyncGenerator[Any, None]:
+        """
+        Converts a synchronous iterable into an asynchronous generator.
+
+        Args:
+            iterable (Any): A synchronous iterable (e.g., list, set, or any iterable object).
+
+        Yields:
+            Any: Items from the synchronous iterable, yielded asynchronously.
+        """
+        for item in iterable:
+            yield item
+
+    async for change in async_generator_from_iterable(root_service.subscribe_changes()):
+        yield json.dumps(change)
+
+
 @root_router.get("/changes")
 async def subscribe_roots_changes(
     user: str = Depends(require_auth),
@@ -1959,7 +2028,7 @@ async def subscribe_roots_changes(
         StreamingResponse with event-stream media type.
     """
     logger.debug(f"User '{user}' subscribed to root changes stream")
-    return StreamingResponse(root_service.subscribe_changes(), media_type="text/event-stream")
+    return StreamingResponse(stream_subscribe_changes(), media_type="text/event-stream")
 
 
 ##################
@@ -1995,14 +2064,16 @@ async def handle_rpc(request: Request, db: Session = Depends(get_db), user: str 
             tools = await tool_service.list_tools(db, cursor=cursor)
             result = [t.model_dump(by_alias=True, exclude_none=True) for t in tools]
         elif method == "initialize":
-            result = initialize(
+            result = await initialize(
                 InitializeRequest(
-                    protocol_version=params.get("protocolVersion") or params.get("protocol_version", ""),
+                    protocolVersion=params.get("protocolVersion") or params.get("protocol_version", ""),
                     capabilities=params.get("capabilities", {}),
-                    client_info=params.get("clientInfo") or params.get("client_info", {}),
+                    clientInfo=params.get("clientInfo") or params.get("client_info", {}),
                 ),
                 user,
-            ).model_dump(by_alias=True, exclude_none=True)
+            )
+            if hasattr(result, "model_dump"):
+                result = result.model_dump(by_alias=True, exclude_none=True)
         elif method == "list_gateways":
             gateways = await gateway_service.list_gateways(db, include_inactive=False)
             result = [g.model_dump(by_alias=True, exclude_none=True) for g in gateways]
@@ -2053,7 +2124,7 @@ async def handle_rpc(request: Request, db: Session = Depends(get_db), user: str 
 
 
 @utility_router.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
+async def websocket_endpoint(websocket: WebSocket) -> None:
     """
     Handle WebSocket connection to relay JSON-RPC requests to the internal RPC endpoint.
 
@@ -2103,7 +2174,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
 
 @utility_router.get("/sse")
-async def utility_sse_endpoint(request: Request, user: str = Depends(require_auth)):
+async def utility_sse_endpoint(request: Request, user: str = Depends(require_auth)) -> EventSourceResponse:
     """
     Establish a Server-Sent Events (SSE) connection for real-time updates.
 
@@ -2140,7 +2211,7 @@ async def utility_sse_endpoint(request: Request, user: str = Depends(require_aut
 
 
 @utility_router.post("/message")
-async def utility_message_endpoint(request: Request, user: str = Depends(require_auth)):
+async def utility_message_endpoint(request: Request, user: str = Depends(require_auth)) -> JSONResponse:
     """
     Handle a JSON-RPC message directed to a specific SSE session.
 
@@ -2205,7 +2276,7 @@ async def set_log_level(request: Request, user: str = Depends(require_auth)) -> 
 # Metrics          #
 ####################
 @metrics_router.get("", response_model=dict)
-async def get_metrics(db: Session = Depends(get_db), user: str = Depends(require_auth)) -> dict:
+async def get_metrics(db: Session = Depends(get_db), user: str = Depends(require_auth)) -> dict[str, Any]:
     """
     Retrieve aggregated metrics for all entity types (Tools, Resources, Servers, Prompts).
 
@@ -2230,7 +2301,7 @@ async def get_metrics(db: Session = Depends(get_db), user: str = Depends(require
 
 
 @metrics_router.post("/reset", response_model=dict)
-async def reset_metrics(entity: Optional[str] = None, entity_id: Optional[int] = None, db: Session = Depends(get_db), user: str = Depends(require_auth)) -> dict:
+async def reset_metrics(entity: Optional[str] = None, entity_id: Optional[int] = None, db: Session = Depends(get_db), user: str = Depends(require_auth)) -> dict[str, Any]:
     """
     Reset metrics for a specific entity type and optionally a specific entity ID,
     or perform a global reset if no entity is specified.
@@ -2271,7 +2342,7 @@ async def reset_metrics(entity: Optional[str] = None, entity_id: Optional[int] =
 # Healthcheck      #
 ####################
 @app.get("/health")
-async def healthcheck(db: Session = Depends(get_db)):
+async def healthcheck(db: Session = Depends(get_db)) -> dict[str, str]:
     """
     Perform a basic health check to verify database connectivity.
 
@@ -2292,7 +2363,7 @@ async def healthcheck(db: Session = Depends(get_db)):
 
 
 @app.get("/ready")
-async def readiness_check(db: Session = Depends(get_db)):
+async def readiness_check(db: Session = Depends(get_db)) -> JSONResponse:
     """
     Perform a readiness check to verify if the application is ready to receive traffic.
 
@@ -2364,7 +2435,7 @@ if UI_ENABLED:
 
     # Redirect root path to admin UI
     @app.get("/")
-    async def root_redirect(request: Request):
+    async def root_redirect(request: Request) -> RedirectResponse:
         """
         Redirects the root path ("/") to "/admin".
 
@@ -2387,7 +2458,7 @@ else:
     logger.warning("Static files not mounted - UI disabled via MCPGATEWAY_UI_ENABLED=False")
 
     @app.get("/")
-    async def root_info():
+    async def root_info() -> dict[str, Any]:
         """
         Returns basic API information at the root path.
 

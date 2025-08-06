@@ -29,7 +29,7 @@ class LoggingService:
     - Logger name tracking
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         """Initialize logging service."""
         self._level = LogLevel.INFO
         self._subscribers: List[asyncio.Queue] = []

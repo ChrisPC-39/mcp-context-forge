@@ -75,7 +75,7 @@ class SamplingHandler:
         4
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         """Initialize sampling handler.
 
         Examples:
