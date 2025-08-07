@@ -36,7 +36,7 @@ import contextvars
 from dataclasses import dataclass
 import logging
 import re
-from typing import List, Union
+from typing import Any, AsyncGenerator, Dict, List, Union
 from uuid import uuid4
 
 # Third-Party
@@ -56,6 +56,7 @@ from starlette.datastructures import Headers
 from starlette.responses import JSONResponse
 from starlette.status import HTTP_401_UNAUTHORIZED
 from starlette.types import Receive, Scope, Send
+from sqlalchemy.orm import Session
 
 # First-Party
 from mcpgateway.config import settings
@@ -309,7 +310,7 @@ class InMemoryEventStore(EventStore):
 
 
 @asynccontextmanager
-async def get_db():
+async def get_db() -> AsyncGenerator[Session, Any]:
     """
     Asynchronous context manager for database sessions.
 
@@ -335,7 +336,7 @@ async def get_db():
 
 
 @mcp_app.call_tool()
-async def call_tool(name: str, arguments: dict) -> List[Union[types.TextContent, types.ImageContent, types.EmbeddedResource]]:
+async def call_tool(name: str, arguments: Dict[str, Any]) -> List[Union[types.TextContent, types.ImageContent, types.EmbeddedResource]]:
     """
     Handles tool invocation via the MCP Server.
 
@@ -533,7 +534,7 @@ class SessionManagerWrapper:
 # ------------------------- Authentication for /mcp routes ------------------------------
 
 
-async def streamable_http_auth(scope, receive, send):
+async def streamable_http_auth(scope, receive, send) -> bool:
     """
     Perform authentication check in middleware context (ASGI scope).
 
@@ -581,6 +582,8 @@ async def streamable_http_auth(scope, receive, send):
         if scheme.lower() == "bearer" and credentials:
             token = credentials
     try:
+        if token is None:
+            raise Exception()
         await verify_credentials(token)
     except Exception:
         response = JSONResponse(
