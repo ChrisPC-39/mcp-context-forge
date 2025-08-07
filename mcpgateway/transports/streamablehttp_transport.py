@@ -68,10 +68,10 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 # Initialize ToolService and MCP Server
-tool_service = ToolService()
-mcp_app = Server("mcp-streamable-http-stateless")
+tool_service: ToolService = ToolService()
+mcp_app: Server = Server("mcp-streamable-http-stateless")
 
-server_id_var: contextvars.ContextVar[str] = contextvars.ContextVar("server_id", default=None)
+server_id_var: contextvars.ContextVar[str] = contextvars.ContextVar("server_id", default="default_server_id")
 
 # ------------------------------ Event store ------------------------------
 
